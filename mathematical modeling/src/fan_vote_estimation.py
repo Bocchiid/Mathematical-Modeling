@@ -1,9 +1,9 @@
 """
-MCM 2026 Problem C - Task 1
-Fan Vote Estimation Model
+MCM 2026 Problem C - Task 1 (Forward-Generation Model)
 
-Goal: Estimate unknown fan votes per contestant/week using judge scores
-and elimination results, under rank-based or percent-based rules.
+Core idea:
+- Generate fan vote shares from performance features + dynamic popularity random walk.
+- No elimination results used in generation; only used in evaluation.
 """
 
 from __future__ import annotations
@@ -14,26 +14,30 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize, linear_sum_assignment, linprog
 import matplotlib.pyplot as plt
 
 
 # -----------------------------
 # Configuration
 # -----------------------------
-TOTAL_FAN_VOTES = 1_000_000  # per week, arbitrary scaling for estimates
-EPSILON = 1e-4               # separation margin for optimization constraints
-SMOOTH_WEIGHT = 0.6          # weight for week-to-week fan share smoothness
-RANK_SCORE_DECAY = 0.35      # exponential decay for rank-to-vote conversion
+TOTAL_VOTES = 1_000_000
 MAX_WEEKS = 11
-TIE_TOL = 1e-6
-ELIM_BIAS = 1.5              # soft bias for eliminated to have worse combined rank
-SURVIVOR_BIAS = 0.2          # soft bias to keep survivors from worst combined ranks
-PENALTY_WEIGHT = 5000.0      # soft penalty for elimination constraint violations
-RANK_SWAP_SPREAD = 0.0       # swap to enforce elimination in rank seasons
-RANK_BLEND_CLOSE = 0.0       # shrink rank-based votes toward judge shares (close weeks)
-RANK_BLEND_SPREAD = 3.0      # judge-spread threshold for applying shrinkage
-RANK_BOTTOM_TWO_MARGIN = 1.0 # allow bottom-two match when ranks are very close
+RANDOM_SEED = 42
+
+# Model parameters (non-fitted, normalized)
+BETA = np.array([1.0, 0.5, 0.3, -0.2, 0.1, 0.05])  # J_z, Jdiff_z, dJ_z, std_z, age_z, age2_z
+RHO = 0.85
+KAPPA = 0.25
+SIGMA_A = 0.25
+SIGMA_D = 0.20  # partner effect
+SIGMA_H = 0.15  # industry effect
+SIGMA_C = 0.10  # country/region effect
+
+# Monte Carlo
+MC_SIMS = 300
+
+# Evaluation thresholds
+RANK_BOTTOM_TWO_MARGIN = 1.0
 
 
 # -----------------------------
@@ -56,10 +60,6 @@ def load_data(csv_path: str) -> pd.DataFrame:
 
 
 def impute_single_na_scores(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    If exactly one judge score is missing in a week, fill it with
-    the mean of the available judge scores for that week/contestant.
-    """
     df = df.copy()
     for week in range(1, MAX_WEEKS + 1):
         cols = [f"week{week}_judge{i}_score" for i in range(1, 5)]
@@ -68,21 +68,16 @@ def impute_single_na_scores(df: pd.DataFrame) -> pd.DataFrame:
             missing = [i for i, v in enumerate(vals) if pd.isna(v)]
             present = [v for v in vals if pd.notna(v)]
             if len(missing) == 1 and len(present) >= 2:
-                fill = float(np.mean(present))
-                df.at[idx, cols[missing[0]]] = fill
+                df.at[idx, cols[missing[0]]] = float(np.mean(present))
     return df
 
 
 def get_voting_method(season: int) -> str:
-    # Rank for seasons 1-2 and 28-34; Percent for 3-27
     return "rank" if season <= 2 or season >= 28 else "percent"
 
 
 def uses_judge_save(season: int) -> bool:
-    # Assumption: judge save used starting season 28
     return season >= 28
-
-
 
 
 def judge_total(row: pd.Series, week: int) -> float:
@@ -116,491 +111,493 @@ def parse_elimination_week(results: str) -> int | None:
     return None
 
 
-def last_active_week(row: pd.Series) -> int | None:
-    active_weeks = []
-    for week in range(1, MAX_WEEKS + 1):
-        total = judge_total(row, week)
-        if pd.notna(total) and total > 0:
-            active_weeks.append(week)
-    return max(active_weeks) if active_weeks else None
-
-
 def elimination_weeks(df: pd.DataFrame) -> Dict[Tuple[int, str], int | None]:
     elim = {}
     for _, row in df.iterrows():
         season = int(row["season"])
         name = row["celebrity_name"]
         elim_week = parse_elimination_week(row["results"])
-
-        if elim_week is None:
-            if isinstance(row["results"], str) and "Withdrew" in row["results"]:
-                elim_week = last_active_week(row)
-            else:
-                elim_week = None
-
         elim[(season, name)] = elim_week
-
     return elim
 
 
 # -----------------------------
-# Rank-based estimation
+# Feature construction
 # -----------------------------
 
-def _prior_rank_map(prior_votes: Dict[str, float] | None, names: List[str]) -> Dict[str, float]:
-    if not prior_votes:
-        return {n: np.nan for n in names}
-    series = pd.Series({n: prior_votes.get(n, np.nan) for n in names})
-    ranks = series.rank(ascending=False, method="average")
-    return {n: float(ranks.loc[n]) for n in names}
+def build_week_features(week_df: pd.DataFrame, week: int) -> pd.DataFrame:
+    df = week_df.copy()
+    df["judge_total"] = df.apply(lambda r: judge_total(r, week), axis=1)
+    df["judge_mean"] = df["judge_total"].mean()
+    df["judge_diff"] = df["judge_total"] - df["judge_mean"]
 
-
-def estimate_rank_week(
-    week_df: pd.DataFrame,
-    elim_names: List[str],
-    prior_votes: Dict[str, float] | None = None,
-    weight_prior: float = 0.4,
-) -> Dict[str, float]:
-    n = len(week_df)
-    if n == 0:
-        return {}
-
-    week_df = week_df.copy()
-    week_df["judge_total"] = week_df.apply(lambda r: judge_total(r, week_df["week"].iloc[0]), axis=1)
-
-    # Rank: 1 = best (highest judge total)
-    week_df["judge_rank"] = week_df["judge_total"].rank(ascending=False, method="average")
-
-    spread = float(np.nanmax(week_df["judge_total"]) - np.nanmin(week_df["judge_total"]))
-
-    # Soft assignment of fan ranks (1 best) using optimization
-    names = week_df["celebrity_name"].tolist()
-    ranks = list(range(1, n + 1))
-    prior_rank = _prior_rank_map(prior_votes, names)
-
-    cost = np.zeros((n, n))
-    for i, name in enumerate(names):
-        judge_r = float(week_df.loc[week_df["celebrity_name"] == name, "judge_rank"].iloc[0])
-        for j, r in enumerate(ranks):
-            prior_r = prior_rank.get(name, np.nan)
-            prior_term = 0.0 if np.isnan(prior_r) else abs(r - prior_r)
-            combined_rank = judge_r + r
-            elim_term = 0.0
-            survivor_term = 0.0
-            if name in elim_names:
-                # encourage higher combined rank for eliminated
-                elim_term = -ELIM_BIAS * (combined_rank / (2 * n))
-            else:
-                # mildly discourage high combined rank for survivors
-                survivor_term = SURVIVOR_BIAS * (combined_rank / (2 * n))
-            cost[i, j] = abs(r - judge_r) + weight_prior * prior_term + elim_term + survivor_term
-
-    row_ind, col_ind = linear_sum_assignment(cost)
-    fan_ranks = {names[i]: ranks[j] for i, j in zip(row_ind, col_ind)}
-
-    # Optional swap to enforce elimination when judge spread is large
-    if spread >= RANK_SWAP_SPREAD and elim_names:
-        judge_rank_map = {name: float(week_df.loc[week_df["celebrity_name"] == name, "judge_rank"].iloc[0])
-                          for name in week_df["celebrity_name"].values}
-        combined = {name: judge_rank_map[name] + fan_ranks[name] for name in week_df["celebrity_name"].values}
-        elim_set = {name for name in elim_names if name in combined}
-        if elim_set:
-            k = max(1, len(elim_set))
-            bottom_k = sorted(combined, key=combined.get, reverse=True)[:k]
-            for elim in list(elim_set):
-                if elim not in bottom_k:
-                    worst = bottom_k[0]
-                    fan_ranks[elim], fan_ranks[worst] = fan_ranks[worst], fan_ranks[elim]
-                    combined[elim] = judge_rank_map[elim] + fan_ranks[elim]
-                    combined[worst] = judge_rank_map[worst] + fan_ranks[worst]
-                    bottom_k = sorted(combined, key=combined.get, reverse=True)[:k]
-
-    # Convert ranks to fan vote shares
-    # Higher rank -> higher votes, use exponential mapping
-    rank_score = {name: np.exp(-RANK_SCORE_DECAY * (fan_ranks[name] - 1)) for name in week_df["celebrity_name"].values}
-    total_score = sum(rank_score.values())
-
-    # Judge-based share for shrinkage
-    judge_total_vec = week_df["judge_total"].to_numpy()
-    judge_share = judge_total_vec / np.nansum(judge_total_vec)
-    judge_share_map = dict(zip(week_df["celebrity_name"].values, judge_share))
-
-    blend = RANK_BLEND_CLOSE if spread <= RANK_BLEND_SPREAD else 0.0
-
-    estimates = {}
-    for name, score in rank_score.items():
-        share = score / total_score
-        blended = (1 - blend) * share + blend * judge_share_map[name]
-        estimates[name] = blended * TOTAL_FAN_VOTES
-
-    return estimates
-
-
-# -----------------------------
-# Percent-based estimation
-# -----------------------------
-
-def estimate_percent_week(
-    week_df: pd.DataFrame,
-    elim_names: List[str],
-    prior_votes: Dict[str, float] | None = None,
-    smooth_weight: float = SMOOTH_WEIGHT,
-) -> Dict[str, float]:
-    n = len(week_df)
-    if n == 0:
-        return {}
-
-    week_df = week_df.copy()
-    week_df["judge_total"] = week_df.apply(lambda r: judge_total(r, week_df["week"].iloc[0]), axis=1)
-
-    judge_totals = week_df["judge_total"].to_numpy()
-    J = np.nansum(judge_totals)
-    judge_percent = judge_totals / J
-
-    # Baseline fan shares: proportional to judge percent
-    baseline = judge_percent.copy()
-
-    # Prior fan shares from previous week (for smoothing)
-    if prior_votes:
-        prior = np.array([prior_votes.get(nm, np.nan) for nm in week_df["celebrity_name"].values], dtype=float)
-        if np.all(np.isnan(prior)):
-            prior = None
-        else:
-            prior = np.nan_to_num(prior, nan=np.nanmean(prior))
-            prior = prior / np.sum(prior)
+    if week == 1:
+        df["delta_j"] = 0.0
+        df["std_j"] = 0.0
     else:
-        prior = None
+        deltas = []
+        stds = []
+        for _, row in df.iterrows():
+            prev = judge_total(row, week - 1)
+            deltas.append(df.loc[row.name, "judge_total"] - prev if pd.notna(prev) else 0.0)
 
-    # Optimization variables: fan share p_i >= 0, sum p_i = 1
-    x0 = np.clip(baseline, 1e-6, 1.0)
-    x0 = x0 / np.sum(x0)
+            history = []
+            for w in range(1, week + 1):
+                jt = judge_total(row, w)
+                if pd.notna(jt):
+                    history.append(jt)
+            stds.append(float(np.std(history)) if len(history) >= 2 else 0.0)
 
-    elim_mask = week_df["celebrity_name"].isin(elim_names).to_numpy()
+        df["delta_j"] = deltas
+        df["std_j"] = stds
 
-    def objective(p):
-        loss = np.sum((p - baseline) ** 2)
-        if prior is not None:
-            loss += smooth_weight * np.sum((p - prior) ** 2)
-        return loss
+    df["age"] = df["celebrity_age_during_season"].astype(float)
+    df["age2"] = df["age"] ** 2
 
-    constraints = [
-        {"type": "eq", "fun": lambda p: np.sum(p) - 1.0}
-    ]
+    for col in ["judge_total", "judge_diff", "delta_j", "std_j", "age", "age2"]:
+        mu = df[col].mean()
+        sd = df[col].std() if df[col].std() > 0 else 1.0
+        df[col + "_z"] = (df[col] - mu) / sd
 
-    # Hard elimination constraints to respect show rules
-    for i in range(n):
-        if not elim_mask[i]:
-            continue
-        for j in range(n):
-            if elim_mask[j]:
-                continue
-            constraints.append({
-                "type": "ineq",
-                "fun": lambda p, i=i, j=j: (judge_percent[j] + p[j]) - (judge_percent[i] + p[i]) - EPSILON
-            })
-
-    bounds = [(0.0, 1.0) for _ in range(n)]
-
-    res = minimize(objective, x0, method="SLSQP", bounds=bounds, constraints=constraints)
-
-    if not res.success:
-        # Fallback: use baseline if optimization fails
-        p = baseline
-        p = p / np.sum(p)
-    else:
-        p = res.x
-
-    estimates = {}
-    for name, share in zip(week_df["celebrity_name"].values, p):
-        estimates[name] = float(share * TOTAL_FAN_VOTES)
-
-    return estimates
+    return df
 
 
 # -----------------------------
-# Main estimation pipeline
+# Forward-generation model
 # -----------------------------
 
 @dataclass
-class WeekEstimate:
+class SimResult:
     season: int
     week: int
-    method: str
-    fan_votes: Dict[str, float]
-    eliminated: List[str]
+    names: List[str]
+    p: np.ndarray
+    a: np.ndarray
 
 
-def estimate_all_weeks(df: pd.DataFrame) -> List[WeekEstimate]:
+def simulate_season(df: pd.DataFrame, season: int, rng: np.random.Generator) -> List[SimResult]:
+    results: List[SimResult] = []
+
+    season_df = df[df["season"] == season].copy()
+    partners = season_df["ballroom_partner"].dropna().unique().tolist()
+    industries = season_df["celebrity_industry"].dropna().unique().tolist()
+    countries = season_df["celebrity_homecountry/region"].dropna().unique().tolist()
+
+    partner_effect = {p: rng.normal(0, SIGMA_D) for p in partners}
+    industry_effect = {i: rng.normal(0, SIGMA_H) for i in industries}
+    country_effect = {c: rng.normal(0, SIGMA_C) for c in countries}
+
+    prev_a: Dict[str, float] = {}
+
+    for week in range(1, MAX_WEEKS + 1):
+        week_df = week_contestants(df, season, week)
+        if week_df.empty:
+            continue
+
+        week_df = build_week_features(week_df, week)
+        names = week_df["celebrity_name"].tolist()
+
+        if week == 1:
+            a = []
+            for _, row in week_df.iterrows():
+                mu = 0.2 * row["age_z"]
+                mu += industry_effect.get(row["celebrity_industry"], 0.0)
+                mu += country_effect.get(row["celebrity_homecountry/region"], 0.0)
+                a.append(rng.normal(mu, 0.5))
+            a = np.array(a)
+        else:
+            a = []
+            for _, row in week_df.iterrows():
+                name = row["celebrity_name"]
+                prev = prev_a.get(name, 0.0)
+                perf = row["judge_diff_z"]
+                a.append(RHO * prev + KAPPA * perf + rng.normal(0, SIGMA_A))
+            a = np.array(a)
+
+        X = week_df[["judge_total_z", "judge_diff_z", "delta_j_z", "std_j_z", "age_z", "age2_z"]].to_numpy()
+        d_partner = week_df["ballroom_partner"].map(partner_effect).fillna(0.0).to_numpy()
+        h_ind = week_df["celebrity_industry"].map(industry_effect).fillna(0.0).to_numpy()
+
+        u = X @ BETA + a + d_partner + h_ind
+        expu = np.exp(u - np.max(u))
+        p = expu / np.sum(expu)
+
+        results.append(SimResult(season=season, week=week, names=names, p=p, a=a))
+        prev_a = {name: val for name, val in zip(names, a)}
+
+    return results
+
+
+# -----------------------------
+# Monte Carlo aggregation
+# -----------------------------
+
+def run_simulations(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    rng = np.random.default_rng(RANDOM_SEED)
+    all_records = []
+    all_a = []
+
+    for b in range(MC_SIMS):
+        for season in sorted(df["season"].dropna().unique()):
+            season = int(season)
+            sim_results = simulate_season(df, season, rng)
+            for res in sim_results:
+                for name, p_val, a_val in zip(res.names, res.p, res.a):
+                    all_records.append({
+                        "sim": b,
+                        "season": res.season,
+                        "week": res.week,
+                        "celebrity_name": name,
+                        "p": p_val,
+                        "votes": p_val * TOTAL_VOTES,
+                    })
+                    all_a.append({
+                        "sim": b,
+                        "season": res.season,
+                        "week": res.week,
+                        "celebrity_name": name,
+                        "a": a_val,
+                    })
+
+    sims = pd.DataFrame(all_records)
+    a_df = pd.DataFrame(all_a)
+
+    summary = sims.groupby(["season", "week", "celebrity_name"]).agg(
+        p_mean=("p", "mean"),
+        p_sd=("p", "std"),
+        p_q025=("p", lambda x: np.quantile(x, 0.025)),
+        p_q975=("p", lambda x: np.quantile(x, 0.975)),
+    ).reset_index()
+
+    summary["p_cv"] = summary["p_sd"] / summary["p_mean"].replace(0, np.nan)
+    summary["votes_mean"] = summary["p_mean"] * TOTAL_VOTES
+
+    a_summary = a_df.groupby(["season", "week", "celebrity_name"]).agg(
+        a_mean=("a", "mean"),
+        a_sd=("a", "std"),
+    ).reset_index()
+
+    return summary, sims, a_summary
+
+
+# -----------------------------
+# Evaluation (test stage)
+# -----------------------------
+
+def evaluate_consistency(df: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
     elim_map = elimination_weeks(df)
-    results = []
+    rows = []
 
     for season in sorted(df["season"].dropna().unique()):
         season = int(season)
         method = get_voting_method(season)
-        prior_votes: Dict[str, float] = {}
 
         for week in range(1, MAX_WEEKS + 1):
             week_df = week_contestants(df, season, week)
             if week_df.empty:
                 continue
 
-            week_df = week_df.copy()
-            week_df["week"] = week
+            week_df = build_week_features(week_df, week)
+            names = week_df["celebrity_name"].tolist()
+            p = summary[(summary["season"] == season) & (summary["week"] == week)]
+            p = p.set_index("celebrity_name").reindex(names)["p_mean"].to_numpy()
 
-            # Identify eliminated contestants in this week
-            elim_names = [
-                name for (s, name), w in elim_map.items()
-                if s == season and w == week
-            ]
-
-            if method == "rank":
-                fan_votes = estimate_rank_week(week_df, elim_names, prior_votes=prior_votes)
+            if method == "percent":
+                judge_percent = week_df["judge_total"].to_numpy()
+                judge_percent = judge_percent / np.nansum(judge_percent)
+                combined = judge_percent + p
+                order = np.argsort(combined)
+                pred = names[order[0]]
+                margin = combined[order[1]] - combined[order[0]] if len(order) >= 2 else np.nan
+                bottom_two = {names[order[0]], names[order[1]]} if len(order) >= 2 else {pred}
             else:
-                fan_votes = estimate_percent_week(week_df, elim_names, prior_votes=prior_votes)
+                judge_rank = week_df["judge_total"].rank(ascending=False, method="average").to_numpy()
+                fan_rank = pd.Series(p, index=names).rank(ascending=False, method="average").to_numpy()
+                combined = judge_rank + fan_rank
+                order = np.argsort(combined)[::-1]
+                pred = names[order[0]]
+                margin = combined[order[0]] - combined[order[1]] if len(order) >= 2 else np.nan
+                bottom_two = {names[order[0]], names[order[1]]} if len(order) >= 2 else {pred}
 
-            results.append(WeekEstimate(
-                season=season,
-                week=week,
-                method=method,
-                fan_votes=fan_votes,
-                eliminated=elim_names,
-            ))
-
-            # Update prior votes for next week (only for continuing contestants)
-            prior_votes = {name: votes for name, votes in fan_votes.items()}
-
-    return results
-
-
-def consistency_metrics(estimates: List[WeekEstimate], df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for est in estimates:
-        if not est.fan_votes:
-            continue
-
-        week_df = week_contestants(df, est.season, est.week)
-        if week_df.empty:
-            continue
-
-        week_df = week_df.copy()
-        week_df["judge_total"] = week_df.apply(lambda r: judge_total(r, est.week), axis=1)
-
-        if est.method == "rank":
-            judge_rank = week_df["judge_total"].rank(ascending=False, method="average")
-            fan_rank = pd.Series(est.fan_votes).reindex(week_df["celebrity_name"]).rank(ascending=False, method="average")
-            combined = judge_rank.values + fan_rank.values
-            order = np.argsort(combined)[::-1]
-            worst_idx = int(order[0])
-            predicted_elim = week_df["celebrity_name"].iloc[worst_idx]
-            margin = combined[order[0]] - combined[order[1]] if len(order) >= 2 else np.nan
-            bottom_two = set(week_df["celebrity_name"].iloc[order[:2]]) if len(order) >= 2 else {predicted_elim}
-        else:
-            judge_percent = week_df["judge_total"].to_numpy()
-            judge_percent = judge_percent / np.nansum(judge_percent)
-            fan_percent = np.array([est.fan_votes[n] for n in week_df["celebrity_name"].values])
-            fan_percent = fan_percent / np.sum(fan_percent)
-            combined = judge_percent + fan_percent
-            worst_val = np.min(combined)
-            worst_idx = int(np.argmin(combined))
-            margin = np.partition(combined, 1)[1] - worst_val if len(combined) >= 2 else np.nan
-            predicted_elim = week_df["celebrity_name"].iloc[worst_idx]
-        actual_elim = est.eliminated[0] if est.eliminated else None
-        correct = None
-        if est.eliminated:
-            if est.method == "rank" and uses_judge_save(est.season):
-                correct = any(e in bottom_two for e in est.eliminated)
-            elif est.method == "rank" and margin is not None and margin <= RANK_BOTTOM_TWO_MARGIN:
-                correct = any(e in bottom_two for e in est.eliminated)
+            actual = [name for (s, name), w in elim_map.items() if s == season and w == week]
+            if not actual:
+                correct = None
             else:
-                correct = predicted_elim in est.eliminated
+                if method == "rank" and (uses_judge_save(season) or (margin is not None and margin <= RANK_BOTTOM_TWO_MARGIN)):
+                    correct = any(a in bottom_two for a in actual)
+                else:
+                    correct = pred in actual
 
-        rows.append({
-            "season": est.season,
-            "week": est.week,
-            "method": est.method,
-            "predicted_elimination": predicted_elim,
-            "actual_elimination": actual_elim,
-            "correct": correct,
-            "margin": margin,
-        })
-
-    return pd.DataFrame(rows)
-
-
-def feasible_width_percent(week_df: pd.DataFrame, elim_names: List[str]) -> pd.DataFrame:
-    """
-    Compute feasible interval widths for fan shares under percent rule.
-    Returns per-contestant min/max and relative width.
-    """
-    n = len(week_df)
-    if n == 0 or not elim_names:
-        return pd.DataFrame()
-
-    week_df = week_df.copy()
-    week_df["judge_total"] = week_df.apply(lambda r: judge_total(r, week_df["week"].iloc[0]), axis=1)
-    judge_percent = week_df["judge_total"].to_numpy()
-    judge_percent = judge_percent / np.nansum(judge_percent)
-
-    elim_mask = week_df["celebrity_name"].isin(elim_names).to_numpy()
-
-    A = []
-    b = []
-    # For each eliminated i and survivor j: (judge_j + p_j) - (judge_i + p_i) >= EPS
-    for i in range(n):
-        if not elim_mask[i]:
-            continue
-        for j in range(n):
-            if elim_mask[j]:
-                continue
-            row = np.zeros(n)
-            row[j] = -1  # move to A p <= b form: -p_j + p_i <= -(judge_j - judge_i - EPS)
-            row[i] = 1
-            A.append(row)
-            b.append(-(judge_percent[j] - judge_percent[i] - EPSILON))
-
-    # Sum p = 1 -> two inequalities
-    A_eq = np.ones((1, n))
-    b_eq = np.array([1.0])
-
-    bounds = [(0.0, 1.0) for _ in range(n)]
-
-    rows = []
-    for k in range(n):
-        c = np.zeros(n)
-        c[k] = 1.0
-
-        # Minimize p_k
-        res_min = linprog(c, A_ub=np.array(A) if A else None, b_ub=np.array(b) if b else None,
-                          A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
-
-        # Maximize p_k -> minimize -p_k
-        res_max = linprog(-c, A_ub=np.array(A) if A else None, b_ub=np.array(b) if b else None,
-                          A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
-
-        if res_min.success and res_max.success:
-            p_min = res_min.x[k]
-            p_max = res_max.x[k]
-            p_mean = (p_min + p_max) / 2
-            rel_width = (p_max - p_min) / p_mean if p_mean > 0 else np.nan
-        else:
-            p_min = p_max = rel_width = np.nan
-
-        rows.append({
-            "season": int(week_df["season"].iloc[0]),
-            "week": int(week_df["week"].iloc[0]),
-            "celebrity_name": week_df["celebrity_name"].iloc[k],
-            "p_min": p_min,
-            "p_max": p_max,
-            "rel_width": rel_width,
-        })
-
-    return pd.DataFrame(rows)
-
-
-def save_results(estimates: List[WeekEstimate], metrics: pd.DataFrame, result_dir: Path) -> None:
-    result_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save fan vote estimates
-    rows = []
-    for est in estimates:
-        for name, votes in est.fan_votes.items():
             rows.append({
-                "season": est.season,
-                "week": est.week,
-                "method": est.method,
-                "celebrity_name": name,
-                "fan_votes": votes,
-                "eliminated": name in est.eliminated,
+                "season": season,
+                "week": week,
+                "method": method,
+                "predicted_elimination": pred,
+                "actual_elimination": actual[0] if actual else None,
+                "correct": correct,
+                "margin": margin,
             })
 
-    pd.DataFrame(rows).to_csv(result_dir / "fan_vote_estimates.csv", index=False)
+    return pd.DataFrame(rows)
 
-    # Save metrics
-    metrics.to_csv(result_dir / "consistency_metrics.csv", index=False)
 
-    # Plot accuracy by season
-    if not metrics.empty:
-        valid = metrics.dropna(subset=["correct"]).copy()
-        if not valid.empty:
-            acc = valid.groupby("season")["correct"].mean().reset_index()
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.bar(acc["season"].astype(int), acc["correct"] * 100, color="#4C78A8")
-            ax.set_title("Elimination Consistency by Season", fontsize=16, weight="bold")
-            ax.set_xlabel("Season", fontsize=12)
-            ax.set_ylabel("Accuracy (%)", fontsize=12)
-            ax.set_ylim(0, 100)
-            ax.grid(axis="y", linestyle="--", alpha=0.4)
-            plt.tight_layout()
-            plt.savefig(result_dir / "accuracy_by_season.png", dpi=200)
-            plt.close(fig)
+def elimination_probability(df: pd.DataFrame, sims: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for season in sorted(df["season"].dropna().unique()):
+        season = int(season)
+        method = get_voting_method(season)
 
-        # Plot margin distribution
+        for week in range(1, MAX_WEEKS + 1):
+            week_df = week_contestants(df, season, week)
+            if week_df.empty:
+                continue
+
+            names = week_df["celebrity_name"].tolist()
+            p = sims[(sims["season"] == season) & (sims["week"] == week)]
+            if p.empty:
+                continue
+
+            judge_tot = week_df.apply(lambda r: judge_total(r, week), axis=1).to_numpy()
+            judge_percent = judge_tot / np.nansum(judge_tot)
+            judge_rank = pd.Series(judge_tot).rank(ascending=False, method="average").to_numpy()
+
+            for sim_id, group in p.groupby("sim"):
+                p_vec = group.set_index("celebrity_name").reindex(names)["p"].to_numpy()
+                if method == "percent":
+                    combined = judge_percent + p_vec
+                    pred = names[int(np.argmin(combined))]
+                else:
+                    fan_rank = pd.Series(p_vec, index=names).rank(ascending=False, method="average").to_numpy()
+                    combined = judge_rank + fan_rank
+                    pred = names[int(np.argmax(combined))]
+                rows.append({"season": season, "week": week, "sim": sim_id, "pred": pred})
+
+    prob = pd.DataFrame(rows).groupby(["season", "week", "pred"]).size().reset_index(name="count")
+    prob["prob"] = prob["count"] / MC_SIMS
+    return prob
+
+
+# -----------------------------
+# Plotting
+# -----------------------------
+
+def save_plots(df: pd.DataFrame, summary: pd.DataFrame, a_summary: pd.DataFrame,
+               metrics: pd.DataFrame, elim_prob: pd.DataFrame, result_dir: Path) -> None:
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    # A1: contestants per season
+    season_counts = df.groupby("season")["celebrity_name"].nunique().reset_index()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(season_counts["season"], season_counts["celebrity_name"], color="#9ECBF3")
+    ax.set_title("Contestants per Season", fontsize=14, weight="bold")
+    ax.set_xlabel("Season")
+    ax.set_ylabel("Count")
+    plt.tight_layout()
+    plt.savefig(result_dir / "contestants_per_season.png", dpi=200)
+    plt.close(fig)
+
+    # A2: weeks per season
+    weeks = []
+    for season in sorted(df["season"].dropna().unique()):
+        season = int(season)
+        w = 0
+        for week in range(1, MAX_WEEKS + 1):
+            if not week_contestants(df, season, week).empty:
+                w += 1
+        weeks.append({"season": season, "weeks": w})
+    weeks_df = pd.DataFrame(weeks)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(weeks_df["season"], weeks_df["weeks"], marker="o", color="#F2B57A")
+    ax.set_title("Weeks per Season", fontsize=14, weight="bold")
+    ax.set_xlabel("Season")
+    ax.set_ylabel("Weeks")
+    plt.tight_layout()
+    plt.savefig(result_dir / "weeks_per_season.png", dpi=200)
+    plt.close(fig)
+
+    # A3: judge total distribution
+    judge_totals = []
+    for season in sorted(df["season"].dropna().unique()):
+        season = int(season)
+        for week in range(1, MAX_WEEKS + 1):
+            week_df = week_contestants(df, season, week)
+            if week_df.empty:
+                continue
+            week_df = build_week_features(week_df, week)
+            judge_totals.extend(week_df["judge_total"].tolist())
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.hist(judge_totals, bins=30, color="#A7D9A6", alpha=0.85)
+    ax.set_title("Judge Total Score Distribution", fontsize=14, weight="bold")
+    ax.set_xlabel("Total Score")
+    ax.set_ylabel("Count")
+    plt.tight_layout()
+    plt.savefig(result_dir / "judge_total_distribution.png", dpi=200)
+    plt.close(fig)
+
+    # A4: judge totals by season (boxplot)
+    by_season = []
+    for season in sorted(df["season"].dropna().unique()):
+        season = int(season)
+        vals = []
+        for week in range(1, MAX_WEEKS + 1):
+            week_df = week_contestants(df, season, week)
+            if week_df.empty:
+                continue
+            week_df = build_week_features(week_df, week)
+            vals.extend(week_df["judge_total"].tolist())
+        by_season.append(vals)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.boxplot(by_season, patch_artist=True, boxprops=dict(facecolor="#AFCDF7", color="#AFCDF7"))
+    ax.set_title("Judge Scores by Season", fontsize=14, weight="bold")
+    ax.set_xlabel("Season")
+    ax.set_ylabel("Total Score")
+    plt.tight_layout()
+    plt.savefig(result_dir / "judge_scores_by_season.png", dpi=200)
+    plt.close(fig)
+
+    # B1: heatmap of p for selected season
+    sel_season = int(df["season"].max())
+    sub = summary[summary["season"] == sel_season].copy()
+    pivot = sub.pivot(index="celebrity_name", columns="week", values="p_mean").fillna(0)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(pivot.values, aspect="auto", cmap="YlGnBu")
+    ax.set_title(f"Vote Share Heatmap (Season {sel_season})", fontsize=14, weight="bold")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Contestant")
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index, fontsize=6)
+    fig.colorbar(im, ax=ax, fraction=0.02)
+    plt.tight_layout()
+    plt.savefig(result_dir / "vote_share_heatmap.png", dpi=200)
+    plt.close(fig)
+
+    # B2: top-3 vote share time series (selected season)
+    season_df = df[df["season"] == sel_season]
+    top3 = season_df.sort_values("placement").head(3)["celebrity_name"].tolist()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for name in top3:
+        series = sub[sub["celebrity_name"] == name].sort_values("week")
+        ax.plot(series["week"], series["p_mean"], marker="o", label=name)
+        ax.fill_between(series["week"], series["p_q025"], series["p_q975"], alpha=0.2)
+    ax.set_title(f"Top-3 Vote Share with 95% CI (Season {sel_season})", fontsize=14, weight="bold")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Vote Share")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(result_dir / "top3_vote_share_ci.png", dpi=200)
+    plt.close(fig)
+
+    # B3: popularity trajectories (champion, mid, early)
+    placements = season_df.dropna(subset=["placement"]).sort_values("placement")
+    champion = placements.iloc[0]["celebrity_name"]
+    mid = placements.iloc[len(placements) // 2]["celebrity_name"]
+    early = placements.iloc[-1]["celebrity_name"]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for name, color in zip([champion, mid, early], ["#8FBCEB", "#F2B57A", "#F6A6A6"]):
+        series = a_summary[(a_summary["season"] == sel_season) & (a_summary["celebrity_name"] == name)].sort_values("week")
+        ax.plot(series["week"], series["a_mean"], marker="o", label=name, color=color)
+    ax.set_title(f"Popularity Trajectories (Season {sel_season})", fontsize=14, weight="bold")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Popularity a")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(result_dir / "popularity_trajectories.png", dpi=200)
+    plt.close(fig)
+
+    # C1: accuracy by season
+    valid = metrics.dropna(subset=["correct"]).copy()
+    if not valid.empty:
+        acc = valid.groupby("season")["correct"].mean().reset_index()
         fig, ax = plt.subplots(figsize=(10, 5))
-        ax.boxplot(valid["margin"].dropna(), vert=False, patch_artist=True,
-                   boxprops=dict(facecolor="#F58518", color="#F58518"),
-                   medianprops=dict(color="white", linewidth=2))
-        ax.set_title("Elimination Margin Distribution (Confidence)", fontsize=16, weight="bold")
-        ax.set_xlabel("Margin", fontsize=12)
-        ax.grid(axis="x", linestyle="--", alpha=0.4)
+        ax.bar(acc["season"], acc["correct"] * 100, color="#B7E0DC")
+        ax.set_title("Elimination Consistency by Season", fontsize=14, weight="bold")
+        ax.set_xlabel("Season")
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_ylim(0, 100)
         plt.tight_layout()
-        plt.savefig(result_dir / "margin_distribution.png", dpi=200)
+        plt.savefig(result_dir / "accuracy_by_season.png", dpi=200)
         plt.close(fig)
 
-    # Plot relative width distribution (percent method only)
-    if not metrics.empty:
-        width_path = result_dir / "feasible_widths.csv"
-        if width_path.exists():
-            widths = pd.read_csv(width_path)
-            widths = widths.dropna(subset=["rel_width"])
-            if not widths.empty:
-                fig, ax = plt.subplots(figsize=(10, 5))
-                ax.hist(widths["rel_width"], bins=30, color="#54A24B", alpha=0.8)
-                ax.set_title("Feasible Width (Relative) Distribution", fontsize=16, weight="bold")
-                ax.set_xlabel("Relative Width", fontsize=12)
-                ax.set_ylabel("Count", fontsize=12)
-                ax.grid(axis="y", linestyle="--", alpha=0.4)
-                plt.tight_layout()
-                plt.savefig(result_dir / "relative_width_distribution.png", dpi=200)
-                plt.close(fig)
+    # C2: margin distribution
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.boxplot(valid["margin"].dropna(), vert=False, patch_artist=True,
+               boxprops=dict(facecolor="#F7C08B", color="#F7C08B"),
+               medianprops=dict(color="white", linewidth=2))
+    ax.set_title("Elimination Margin Distribution", fontsize=14, weight="bold")
+    ax.set_xlabel("Margin")
+    plt.tight_layout()
+    plt.savefig(result_dir / "margin_distribution.png", dpi=200)
+    plt.close(fig)
 
+    # D1: width heatmap
+    width = summary.copy()
+    width["width"] = width["p_q975"] - width["p_q025"]
+    pivot_w = width[width["season"] == sel_season].pivot(index="celebrity_name", columns="week", values="width").fillna(0)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(pivot_w.values, aspect="auto", cmap="YlOrBr")
+    ax.set_title(f"Width Heatmap (Season {sel_season})", fontsize=14, weight="bold")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Contestant")
+    ax.set_yticks(range(len(pivot_w.index)))
+    ax.set_yticklabels(pivot_w.index, fontsize=6)
+    fig.colorbar(im, ax=ax, fraction=0.02)
+    plt.tight_layout()
+    plt.savefig(result_dir / "width_heatmap.png", dpi=200)
+    plt.close(fig)
+
+    # D2: width vs margin scatter
+    width_week = summary.copy()
+    width_week["width"] = width_week["p_q975"] - width_week["p_q025"]
+    width_week = width_week.groupby(["season", "week"])["width"].mean().reset_index()
+    merged = metrics.merge(width_week, on=["season", "week"], how="left")
+    if not merged.empty:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.scatter(merged["margin"], merged["width"], s=10, alpha=0.5, color="#9ECBF3")
+        ax.set_title("Width vs Margin", fontsize=14, weight="bold")
+        ax.set_xlabel("Margin")
+        ax.set_ylabel("Width")
+        plt.tight_layout()
+        plt.savefig(result_dir / "width_vs_margin.png", dpi=200)
+        plt.close(fig)
+
+    # D3: elimination probability over weeks (selected season)
+    prob = elim_prob[elim_prob["season"] == sel_season]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for week in sorted(prob["week"].unique()):
+        subp = prob[prob["week"] == week].sort_values("prob", ascending=False).head(1)
+        ax.bar(week, subp["prob"].iloc[0], color="#F3A6A6")
+    ax.set_title(f"Top Elimination Probability by Week (Season {sel_season})", fontsize=14, weight="bold")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Probability")
+    plt.tight_layout()
+    plt.savefig(result_dir / "elim_prob_by_week.png", dpi=200)
+    plt.close(fig)
+
+
+# -----------------------------
+# Main
+# -----------------------------
 
 def run(csv_path: str, result_dir: Path) -> None:
     df = load_data(csv_path)
     df = impute_single_na_scores(df)
-    estimates = estimate_all_weeks(df)
-    metrics = consistency_metrics(estimates, df)
 
-    print("\nFan vote estimation complete.")
-    print("Total week estimates:", len(estimates))
+    summary, sims, a_summary = run_simulations(df)
+    metrics = evaluate_consistency(df, summary)
+    elim_prob = elimination_probability(df, sims)
 
-    if not metrics.empty:
-        valid = metrics.dropna(subset=["correct"])
-        if not valid.empty:
-            accuracy = valid["correct"].mean()
-            print(f"Elimination consistency (accuracy): {accuracy:.2%}")
-        else:
-            print("No eliminations found for consistency check.")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(result_dir / "fan_vote_estimates.csv", index=False)
+    metrics.to_csv(result_dir / "consistency_metrics.csv", index=False)
+    a_summary.to_csv(result_dir / "popularity_estimates.csv", index=False)
+    elim_prob.to_csv(result_dir / "elimination_probability.csv", index=False)
 
-    # Feasible width estimates (percent method only)
-    width_rows = []
-    for est in estimates:
-        if est.method != "percent" or not est.eliminated:
-            continue
-        week_df = week_contestants(df, est.season, est.week)
-        if week_df.empty:
-            continue
-        week_df = week_df.copy()
-        week_df["week"] = est.week
-        width_df = feasible_width_percent(week_df, est.eliminated)
-        if not width_df.empty:
-            width_rows.append(width_df)
+    save_plots(df, summary, a_summary, metrics, elim_prob, result_dir)
 
-    if width_rows:
-        widths = pd.concat(width_rows, ignore_index=True)
-        widths.to_csv(result_dir / "feasible_widths.csv", index=False)
-
-    save_results(estimates, metrics, result_dir)
-    print(f"Results saved to: {result_dir}")
+    valid = metrics.dropna(subset=["correct"])
+    if not valid.empty:
+        acc = valid["correct"].mean()
+        print(f"Elimination consistency (accuracy): {acc:.2%}")
 
 
 if __name__ == "__main__":
