@@ -177,11 +177,31 @@ class GenerativeVoteModel:
         # Regression coefficients
         self.alpha = 0.8      # response to judge scores
         self.beta = 0.5       # trend effect (improvement history)
-        self.gamma = 0.3      # celebrity-week interaction
-        self.delta = 0.2      # regional effect
+        self.gamma = 0.3      # celebrity-week interaction (ACTIVATED)
+        self.delta = 0.2      # regional effect (ACTIVATED)
         self.eta_industry = {}  # industry fixed effects
         self.tau_week = {}    # week fixed effects
         self.sigma_v = 0.3    # vote variance
+        
+        # Industry-based popularity priors (celebrity factor)
+        self.industry_priors = {
+            'nfl': 0.8,
+            'actor': 0.6,
+            'athlete': 0.9,
+            'musician': 0.7,
+            'model': 0.5,
+            'politician': 0.4,
+            'reality_star': 0.5,
+            'default': 0.5
+        }
+    
+    def get_industry_effect(self, industry: str) -> float:
+        """
+        Get celebrity popularity factor based on industry.
+        NFL players typically have larger fan bases.
+        """
+        industry_lower = str(industry).lower().strip()
+        return self.industry_priors.get(industry_lower, self.industry_priors['default'])
         
     def compute_mean_structure(self,
                                z_score: float,
@@ -547,11 +567,15 @@ def export_results(df: pd.DataFrame, features: Dict, model: GenerativeVoteModel,
     season_accuracy = []
     for season, stats in sorted(eval_results['by_season'].items()):
         acc = stats['correct'] / max(stats['total'], 1)
+        weak_acc = stats['weak_correct'] / max(stats['total'], 1)
         season_accuracy.append({
             'Season': season,
+            'Method': stats['method'],
             'Total_Weeks': stats['total'],
-            'Correct_Predictions': stats['correct'],
-            'Accuracy': acc
+            'Exact_Correct': stats['correct'],
+            'Bottom2_Correct': stats['weak_correct'],
+            'Exact_Accuracy': acc,
+            'Bottom2_Accuracy': weak_acc
         })
     
     season_df = pd.DataFrame(season_accuracy)
@@ -609,13 +633,16 @@ def evaluate_bottom_two(df: pd.DataFrame, features: Dict, model: GenerativeVoteM
     """
     Evaluate accuracy at predicting bottom-two eliminations.
     
-    For each week, predict the two contestants with lowest composite scores.
-    Compare against actual placement (lower placement = eliminated).
+    Two scoring methods:
+    - S1-S2 (Ranking): Lower composite rank = worse (higher elimination risk)
+    - S3-S34 (Percentage): Lower composite pct = worse (higher elimination risk)
+    
+    Actual elimination identified from Result column (e.g., "Eliminated Week 3").
     """
     results = {
         'total_weeks': 0,
         'correct_predictions': 0,
-        'kendall_tau': [],
+        'weak_correct': 0,  # Eliminated person in bottom-two
         'by_season': {}
     }
     
@@ -626,50 +653,105 @@ def evaluate_bottom_two(df: pd.DataFrame, features: Dict, model: GenerativeVoteM
         if len(week_contestants) < 2:
             continue
         
+        # Get actual elimination for this week from Result column
+        actual_eliminated = None
+        for idx, row in group.iterrows():
+            result_str = str(row['Result']).lower()
+            week_str = str(int(week))
+            if f'eliminated week {week_str}' in result_str or f'eliminated week{week_str}' in result_str:
+                actual_eliminated = row['Name']
+                break
+        
         # Compute composite scores for each contestant this week
-        scores_dict = {}
+        judge_scores = {}
+        predicted_votes_dict = {}
+        
         for contestant in week_contestants:
             key = (season, week, contestant)
             if key in features:
                 feat = features[key]
                 z_score = feat['z_score']
+                judge_score = feat['judge_score']  # Use raw judge score (not z-score!)
                 trend = feat['trend']
+                region_factor = feat['region_factor']
+                industry = feat['industry']
                 
-                # Predicted vote mean
-                mu = model.alpha * z_score + model.beta * trend
+                # Compute celeb_factor based on industry
+                celeb_factor = model.get_industry_effect(industry)
+                
+                # Predicted vote mean (NOW INCLUDES gamma and delta!)
+                mu = (model.alpha * z_score + 
+                      model.beta * trend + 
+                      model.gamma * celeb_factor + 
+                      model.delta * region_factor)
                 predicted_votes = model.generate_votes(mu, n_votes=1)[0]
                 
-                # Composite: judge score + predicted votes
-                composite = (z_score + np.log(predicted_votes + 1)) / 2
-                scores_dict[contestant] = composite
+                judge_scores[contestant] = judge_score
+                predicted_votes_dict[contestant] = predicted_votes
         
-        if len(scores_dict) < 2:
+        if len(judge_scores) < 2:
             continue
         
-        # Predict bottom two (lowest scores)
-        sorted_by_score = sorted(scores_dict.items(), key=lambda x: x[1])
-        predicted_bottom_two = {sorted_by_score[0][0], sorted_by_score[1][0]} if len(sorted_by_score) > 1 else set()
+        # Season-specific scoring method
+        if season <= 2:
+            # S1-S2: Ranking method (judge rank + vote rank)
+            judge_ranks = pd.Series(judge_scores).rank(ascending=False).to_dict()
+            vote_ranks = pd.Series(predicted_votes_dict).rank(ascending=False).to_dict()
+            composite_scores = {c: judge_ranks.get(c, 0) + vote_ranks.get(c, 0) 
+                               for c in judge_scores.keys()}
+            # Lower composite rank = worse
+            sorted_by_score = sorted(composite_scores.items(), key=lambda x: x[1])
+        else:
+            # S3-S34: Percentage method (judge% + vote%)
+            judge_total = sum(judge_scores.values())
+            vote_total = sum(predicted_votes_dict.values())
+            
+            judge_pct = {c: judge_scores[c] / max(judge_total, 1e-8) 
+                        for c in judge_scores.keys()}
+            vote_pct = {c: predicted_votes_dict[c] / max(vote_total, 1e-8) 
+                       for c in judge_scores.keys()}
+            composite_scores = {c: judge_pct[c] + vote_pct[c] for c in judge_scores.keys()}
+            # Higher composite pct = better
+            sorted_by_score = sorted(composite_scores.items(), key=lambda x: x[1], reverse=True)
         
-        # Actual bottom two (highest placement number)
-        group['placement'] = pd.to_numeric(group['placement'], errors='coerce')
-        sorted_by_placement = group.nlargest(2, 'placement')['Name'].values
-        actual_bottom_two = set(sorted_by_placement)
+        # Predict bottom two (worst scores)
+        predicted_bottom_two = {sorted_by_score[-1][0], sorted_by_score[-2][0]} \
+            if len(sorted_by_score) > 1 else set()
+        predicted_eliminated = sorted_by_score[-1][0]  # Worst score = most likely eliminated
         
         results['total_weeks'] += 1
-        if predicted_bottom_two == actual_bottom_two:
-            results['correct_predictions'] += 1
+        
+        # Evaluate prediction accuracy
+        if actual_eliminated:
+            # Check exact match (predicted worst score = actual elimination)
+            if predicted_eliminated == actual_eliminated:
+                results['correct_predictions'] += 1
+            
+            # Check weak consistency (actual eliminated in bottom-two)
+            if actual_eliminated in predicted_bottom_two:
+                results['weak_correct'] += 1
         
         if season not in results['by_season']:
-            results['by_season'][season] = {'total': 0, 'correct': 0}
+            results['by_season'][season] = {
+                'total': 0,
+                'correct': 0,
+                'weak_correct': 0,
+                'method': 'Ranking' if season <= 2 else 'Percentage'
+            }
         
         results['by_season'][season]['total'] += 1
-        if predicted_bottom_two == actual_bottom_two:
-            results['by_season'][season]['correct'] += 1
+        if actual_eliminated:
+            if predicted_eliminated == actual_eliminated:
+                results['by_season'][season]['correct'] += 1
+            if actual_eliminated in predicted_bottom_two:
+                results['by_season'][season]['weak_correct'] += 1
     
     if results['total_weeks'] > 0:
         results['accuracy'] = results['correct_predictions'] / results['total_weeks']
+        results['weak_accuracy'] = results['weak_correct'] / results['total_weeks']
     else:
         results['accuracy'] = 0.0
+        results['weak_accuracy'] = 0.0
     
     return results
 
@@ -1122,16 +1204,19 @@ def main():
     # Evaluation with optimized parameters
     print(f"\n--- Final Model Evaluation ---")
     eval_results = evaluate_bottom_two(df, features, vote_model)
-    print(f"Bottom-two prediction accuracy: {eval_results['accuracy']:.2%}")
+    print(f"Exact elimination prediction accuracy: {eval_results['accuracy']:.2%}")
     print(f"  Correct: {eval_results['correct_predictions']}/{eval_results['total_weeks']}")
+    print(f"Bottom-two ('Judge's Save') accuracy: {eval_results['weak_accuracy']:.2%}")
+    print(f"  In bottom-two: {eval_results['weak_correct']}/{eval_results['total_weeks']}")
     
-    # Accuracy by season (sample)
-    print(f"\nAccuracy by season (top 10):")
-    season_accs = [(s, stats['correct']/max(stats['total'], 1)) 
+    # Accuracy by season
+    print(f"\nAccuracy by season (sorted by exact accuracy):")
+    season_accs = [(s, stats['correct']/max(stats['total'], 1), 
+                   stats['weak_correct']/max(stats['total'], 1), stats['method']) 
                    for s, stats in eval_results['by_season'].items() if stats['total'] > 0]
     season_accs.sort(key=lambda x: x[1], reverse=True)
-    for i, (season, acc) in enumerate(season_accs[:10]):
-        print(f"  {i+1}. Season {season}: {acc:.1%}")
+    for i, (season, exact_acc, weak_acc, method) in enumerate(season_accs[:10]):
+        print(f"  {i+1}. Season {season:2d} ({method:9s}): Exact={exact_acc:5.1%}, Bottom2={weak_acc:5.1%}")
     
     # Export results
     print(f"\n--- Exporting Results ---")
@@ -1155,7 +1240,8 @@ def main():
     
     print("\n" + "=" * 80)
     print("Model estimation complete! All results saved to 'result/' directory.")
-    print(f"Final Accuracy Improvement: {eval_results['accuracy']:.2%} (from baseline 0.53%)")
+    print(f"Exact Elimination Prediction Accuracy: {eval_results['accuracy']:.2%}")
+    print(f"Bottom-Two Inclusion Accuracy (Judge's Save): {eval_results['weak_accuracy']:.2%}")
     print("=" * 80)
 
 
