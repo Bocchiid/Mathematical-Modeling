@@ -1,6 +1,0 @@
-Parameter,Value,Description
-alpha,0.9716543090240357,Judge score response
-beta,0.43003445646874033,Trend response
-gamma,0.3,Celebrity-week interaction
-delta,0.2,Regional effect
-sigma_v,0.3,Vote variance
