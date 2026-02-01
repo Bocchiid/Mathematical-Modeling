@@ -90,6 +90,7 @@ class DWTSFinalSubmissionModel:
     def solve_all(self):
         seasons = sorted(self.df['season'].unique())
         summary, cert_details = [], []
+        vote_shares_data = []  # 记录投票份额
 
         print("Optimizing 34 Seasons based on evolving rules...")
         for s_id in seasons:
@@ -108,8 +109,20 @@ class DWTSFinalSubmissionModel:
                 ctx = weeks_ctx[w]
                 if ctx['elim_idx'] == -1: continue
                 total_w += 1
-                v, _ = self.calculate_survival_v(f_opt[i], ctx['scores'], ctx['active_mask'], s_id)
+                v, shares = self.calculate_survival_v(f_opt[i], ctx['scores'], ctx['active_mask'], s_id)
                 v_inf = np.where(ctx['active_mask'], v, np.inf)
+
+                # 记录投票份额
+                for c_idx in range(n_con):
+                    if ctx['active_mask'][c_idx]:
+                        vote_shares_data.append({
+                            'Season': s_id,
+                            'Week': w,
+                            'Celebrity': names[c_idx],
+                            'Vote_Share': shares[c_idx],
+                            'Survival_Value': v[c_idx],
+                            'Judge_Score': ctx['scores'][c_idx]
+                        })
 
                 # EAA 逻辑判断
                 if s_id >= 28:
@@ -130,7 +143,7 @@ class DWTSFinalSubmissionModel:
 
             summary.append({'Season': s_id, 'EAA': correct_w / total_w, 'SCS': np.exp(-res.fun / (total_w + 1))})
 
-        return pd.DataFrame(summary), pd.DataFrame(cert_details)
+        return pd.DataFrame(summary), pd.DataFrame(cert_details), pd.DataFrame(vote_shares_data)
 
 
 # --- 美赛O奖级可视化部分 ---
@@ -144,7 +157,7 @@ result_dir = os.path.join(script_dir, '../result')
 os.makedirs(result_dir, exist_ok=True)
 
 model = DWTSFinalSubmissionModel(data_path)
-sum_df, cert_df = model.solve_all()
+sum_df, cert_df, vote_df = model.solve_all()
 
 # 设置全局美观风格
 plt.rcParams['font.family'] = 'DejaVu Sans'
@@ -420,6 +433,20 @@ summary_stats = {
 stats_df = pd.DataFrame(summary_stats)
 stats_df.to_csv(os.path.join(result_dir, 'Statistics_Summary.csv'), index=False)
 print(f"✓ Saved: Statistics_Summary.csv")
+
+# ============ 导出投票份额数据 ============
+vote_df_sorted = vote_df.sort_values(['Season', 'Week', 'Vote_Share'], ascending=[True, True, False])
+vote_filename = 'Fan_Vote_Estimates_by_Celebrity_Week_Season.csv'
+vote_df_sorted.to_csv(os.path.join(result_dir, vote_filename), index=False)
+print(f"✓ Saved: {vote_filename}")
+
+# 输出投票份额统计
+print(f"\n📊 FAN VOTE SHARE STATISTICS")
+print(f"   • Total Records: {len(vote_df)}")
+print(f"   • Mean Vote Share: {vote_df['Vote_Share'].mean():.6f}")
+print(f"   • Std Dev: {vote_df['Vote_Share'].std():.6f}")
+print(f"   • Min: {vote_df['Vote_Share'].min():.6f}")
+print(f"   • Max: {vote_df['Vote_Share'].max():.6f}")
 
 # 输出模型完整报告
 print("\n" + "="*80)
