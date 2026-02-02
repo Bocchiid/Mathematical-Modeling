@@ -36,21 +36,12 @@ os.makedirs(output_dir, exist_ok=True)
 df_main = pd.read_csv('../result_01/Fan_Vote_Estimates_by_Celebrity_Week_Season.csv').rename(
     columns={'Celebrity': 'celebrity_name'}
 )
-# Load from main data if exists
-try:
-    df_meta = pd.read_csv('2026_MCM_Problem_C_Data.csv')
-    df_main = df_main.merge(df_meta[['celebrity_name', 'celebrity_age_during_season', 
-                                       'ballroom_partner', 'celebrity_homecountry/region', 
-                                       'celebrity_industry', 'placement']], 
-                            on='celebrity_name', how='left')
-except:
-    # Generate synthetic metadata for visualization purposes
-    np.random.seed(42)
-    df_main['celebrity_age_during_season'] = np.random.randint(20, 70, len(df_main))
-    df_main['ballroom_partner'] = np.random.choice(['Pro_A', 'Pro_B', 'Pro_C'], len(df_main))
-    df_main['celebrity_homecountry/region'] = np.random.choice(['United States', 'Other'], len(df_main))
-    df_main['celebrity_industry'] = np.random.choice(['Entertainment', 'Sports', 'Politics'], len(df_main))
-    df_main['placement'] = np.random.randint(1, 20, len(df_main))
+# Load metadata
+df_meta = pd.read_csv('../data/2026_MCM_Problem_C_Data.csv')
+df_main = df_main.merge(df_meta[['celebrity_name', 'celebrity_age_during_season', 
+                                   'ballroom_partner', 'celebrity_homecountry/region', 
+                                   'celebrity_industry', 'placement']], 
+                        on='celebrity_name', how='left')
 
 # ==========================================
 # 2. Feature Engineering
@@ -83,19 +74,36 @@ df_main_processed = pd.concat([df_main, industry_dummies], axis=1)
 merged = df_main_processed.copy()
 merged = merged.dropna(subset=['Judge_Score', 'Vote_Share', 'Age_Gauss', 'Pro_Power'])
 
-# Standardization
+# Define all features to standardize
+features = ['Age_Gauss', 'Pro_Power', 'Is_US'] + [c for c in industry_dummies.columns]
+
+# ★ CRITICAL FIX: Standardize ALL features (including Is_US and industry dummies)
+# This ensures fair comparison of coefficients on the same scale
 scaler = StandardScaler()
-cols_to_scale = ['Judge_Score', 'Vote_Share', 'Age_Gauss', 'Pro_Power']
+cols_to_scale = ['Judge_Score', 'Vote_Share'] + features
 merged[cols_to_scale] = scaler.fit_transform(merged[cols_to_scale])
 
 # ==========================================
 # 4. Regression Models
 # ==========================================
-features = ['Age_Gauss', 'Pro_Power', 'Is_US'] + [c for c in industry_dummies.columns]
+# Features already defined above
 X = sm.add_constant(merged[features].astype(float))
 
 model_judge = sm.OLS(merged['Judge_Score'], X).fit()
 model_fan = sm.OLS(merged['Vote_Share'], X).fit()
+
+# Print model summaries for verification
+print("\n" + "="*80)
+print("MODEL 3: DUAL-PATH REGRESSION ANALYSIS")
+print("="*80)
+print(f"\nSample Size: {len(merged)}")
+print(f"Number of Features: {len(features)}")
+print(f"\nJudge Path Model Summary:")
+print(f"  R-squared: {model_judge.rsquared:.6f}")
+print(f"  Adjusted R-squared: {model_judge.rsquared_adj:.6f}")
+print(f"\nFan Path Model Summary:")
+print(f"  R-squared: {model_fan.rsquared:.6f}")
+print(f"  Adjusted R-squared: {model_fan.rsquared_adj:.6f}")
 
 # ==========================================
 # 5. PROFESSIONAL VISUALIZATIONS - MCM/ICM O-AWARD QUALITY
